@@ -1,5 +1,5 @@
 # \[G\]o\[PT\]est
-
+Just don't ask about the name
 ## Installation
 `go install github.com/sentiens/goptest@latest`
 
