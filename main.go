@@ -90,7 +90,8 @@ func codeGenerationPrompt(whatToTest string, spec Spec, functionalityDesc string
 			"Here is the original code that needs to be tested: ```go\n%s```\n"+
 			"The functionality you need to test is '%s' and here is a description of the functionality: ```%s```\n"+
 			"Here is the specification of the test you should implement: ```%s```\n"+
-			"Please use the following template for your output, replacing any placeholders and comments with your own. However, avoid repeating any original code:\n```go\n%s\n```\n"+
+			"Please use the following template for your output, avoid repeating any original code and use prefixes related to test "+
+			"case for any extra definitions(mocks, helper functions, etc) outside of the test function:\n```go\n%s\n```\n"+
 			"Your output should be valid Go test code, including any necessary comments."+
 			"Begin generating the code now.\n",
 		allTheCode,
