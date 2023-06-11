@@ -4,6 +4,9 @@
 `go install github.com/sentiens/goptest@latest`
 
 ## Usage
+Only GPT4 is supported. TODO: More configuration options.
+
+1. Set OPENAI_API_KEY environment variable
 1. First generate specification for the tested code:
 ```goptest -cases=true -what="Add function" -spec-file=specs.yaml -code-files=testcode.go```
 
