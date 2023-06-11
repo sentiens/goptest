@@ -417,7 +417,6 @@ func main() {
 	}
 
 	responses := make([]string, len(specs.Specs))
-	var responsesLock sync.Mutex
 	var wg sync.WaitGroup
 	var max = make(chan struct{}, 4)
 	for i, spec := range specs.Specs {
@@ -433,8 +432,6 @@ func main() {
 			if err != nil {
 				log.Fatalf("Failed to generate test code for spec '%s': %v", spec.Description, err)
 			}
-			responsesLock.Lock()
-			defer responsesLock.Unlock()
 			responses[i] = code
 			fmt.Println("Done generating test")
 		}(i, spec)
