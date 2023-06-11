@@ -419,7 +419,7 @@ func main() {
 	responses := make([]string, len(specs.Specs))
 	var responsesLock sync.Mutex
 	var wg sync.WaitGroup
-	var max = make(chan struct{}, 10)
+	var max = make(chan struct{}, 4)
 	for i, spec := range specs.Specs {
 		max <- struct{}{}
 		wg.Add(1)
