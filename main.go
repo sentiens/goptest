@@ -12,30 +12,118 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/sashabaranov/go-openai"
-	"gopkg.in/yaml.v2"
+	openai "github.com/sashabaranov/go-openai"
+	yaml "gopkg.in/yaml.v2"
 )
 
-// Spec represents a single test specification.
-type Spec struct {
-	Name        string `yaml:"name"`
-	Description string `yaml:"description"`
+func fatalf(msg string, a ...any) {
+	fmt.Fprintf(os.Stderr, msg, a...)
+	os.Exit(1)
+
+}
+
+func isPackageDeclaration(line string) bool {
+	return strings.HasPrefix(line, "package ")
+}
+
+func isGPTAddedCodeBlockDelimeter(line string) bool {
+	return strings.HasPrefix(line, "```")
+}
+
+func startsImportBlock(line string) bool {
+	return strings.HasPrefix(line, "import (")
+}
+
+func isSingleImportStatement(line string) bool {
+	return strings.HasPrefix(line, "import \"")
+}
+
+func handleImportBlock(lines []string, imports *strings.Builder, importSet map[string]struct{}) int {
+	for i, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmedLine, ")") {
+			return i + 1
+		}
+		addImport(imports, trimmedLine, importSet)
+	}
+	panic("import block not closed")
+}
+
+func addImport(imports *strings.Builder, importLine string, importSet map[string]struct{}) {
+	if _, exists := importSet[importLine]; !exists {
+		imports.WriteString("\t" + importLine + "\n")
+		importSet[importLine] = struct{}{}
+	}
+}
+
+func combineSections(packageDecl, imports, functions string) string {
+	var combined strings.Builder
+	if packageDecl != "" {
+		combined.WriteString("package " + packageDecl + "\n")
+	}
+	combined.WriteString("\n")
+	if imports != "" {
+		combined.WriteString("\nimport (\n")
+		combined.WriteString(imports)
+		combined.WriteString(")\n\n")
+	}
+	combined.WriteString(functions)
+	return combined.String()
+}
+
+// AggregateFiles combines responses into a single string, ensuring that the output is a valid Go tests file.
+func AggregateFiles(pkgName string, fs []string, comment bool) string {
+	var imports strings.Builder
+	var functions strings.Builder
+
+	importSet := make(map[string]struct{})
+
+	for _, response := range fs {
+		lines := strings.Split(response, "\n")
+
+		for i := 0; i < len(lines); i++ {
+			line := lines[i]
+			trimmedLine := strings.TrimSpace(line)
+
+			switch {
+			case isPackageDeclaration(trimmedLine), isGPTAddedCodeBlockDelimeter(trimmedLine):
+				continue
+
+			case startsImportBlock(trimmedLine):
+				i += handleImportBlock(lines[i+1:], &imports, importSet)
+
+			case isSingleImportStatement(trimmedLine):
+				addImport(&imports, strings.TrimPrefix(trimmedLine, "import "), importSet)
+
+			default:
+
+				// Appending function bodies
+				if comment {
+					functions.WriteString("// ")
+				}
+				functions.WriteString(line + "\n")
+			}
+		}
+		functions.WriteString("\n")
+	}
+
+	return combineSections(pkgName, imports.String(), functions.String())
 }
 
 // ConcatFiles combines multiple code files into a single string.
 func ConcatFiles(fs []string) (pkgName string, files string, err error) {
 	// TODO: Summarize methods and dependencies as signatures
 
-	var cb strings.Builder
+	var rfs []string
 
 	for i, f := range fs {
 		fc, err := os.ReadFile(f)
 		if err != nil {
 			return "", "", err
 		}
-
-		// prepend the package name to the first file content only
+		rfs = append(rfs, string(fc))
 		if i == 0 {
 			scanner := bufio.NewScanner(bytes.NewReader(fc))
 			for scanner.Scan() {
@@ -50,114 +138,76 @@ func ConcatFiles(fs []string) (pkgName string, files string, err error) {
 			}
 		}
 
-		cb.WriteString("// " + f + "\n")
-		cb.Write(fc)
-		cb.WriteString("\n")
 	}
+	s := AggregateFiles(pkgName, rfs, false)
 
-	cc := cb.String()
-	return pkgName, cc, nil
+	return pkgName, s, nil
 }
 
 // Client is a client for interacting with the OpenAI API.
 type Client struct {
-	client *openai.Client
+	model     string
+	maxTokens uint
+	client    *openai.Client
 }
 
 // NewClient initializes a new OpenAI API client.
-func NewClient() (*Client, error) {
+func NewClient(model string, maxTokens int) (*Client, error) {
 	k := os.Getenv("OPENAI_API_KEY")
 	if k == "" {
 		return nil, errors.New("no OpenAI API key provided")
 	}
 	c := openai.NewClient(k)
-
-	return &Client{c}, nil
-}
-
-func testCodeTemplate(name string) string {
-	return fmt.Sprintf(`// %s tests the function with given conditions.
-func %s(t *testing.T) {
-	// The test code goes here
-}
-`, name, name)
-}
-
-func codeGenerationPrompt(whatToTest string, spec Spec, functionalityDesc string, allTheCode string) string {
-	return fmt.Sprintf(
-		"You are a highly skilled Go developer with a knack for identifying potential bugs and edge cases.\n"+
-			"You have been tasked with implementing a test function designed by a TDD expert, but you believe in understanding and scrutinizing the task at hand rather than blindly following authority.\n"+
-			"Here is the original code that needs to be tested: ```go\n%s```\n"+
-			"The functionality you need to test is '%s' and here is a description of the functionality: ```%s```\n"+
-			"Here is the specification of the test you should implement: ```%s```\n"+
-			"Please use the following template for your output, avoid repeating any original code and use prefixes related to test "+
-			"case for any extra definitions(mocks, helper functions, etc) outside of the test function:\n```go\n%s\n```\n"+
-			"Your output should be valid Go test code, including any necessary comments."+
-			"Begin generating the code now.\n",
-		allTheCode,
-		whatToTest,
-		functionalityDesc,
-		spec.Description,
-		testCodeTemplate(spec.Name),
-	)
-}
-
-// GenerateTestCode generates test code using the OpenAI chat completion API.
-func (c *Client) GenerateTestCode(spec Spec, whatToTest string, codeDescription string, allCode string) (string, error) {
-	//TODO: Implement retries to not blow up the whole process
-
-	ctx := context.Background()
-
-	content := codeGenerationPrompt(whatToTest, spec, codeDescription, allCode)
-
-	msg := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: content,
+	if maxTokens == 0 {
+		if model == openai.GPT4 {
+			maxTokens = 4000
+		} else {
+			maxTokens = 2048
+		}
 	}
 
-	req := openai.ChatCompletionRequest{
-		Model:       openai.GPT4,
-		MaxTokens:   4000,
-		Temperature: 0.8,
+	return &Client{
+		model,
+		uint(maxTokens),
+		c,
+	}, nil
+}
 
-		Messages: []openai.ChatCompletionMessage{
-			msg,
-		},
+const SectionSeparator = "*************************************************************************"
+
+func (c *Client) BasicCompletionRequest() openai.ChatCompletionRequest {
+	return openai.ChatCompletionRequest{
+		Model:     c.model,
+		MaxTokens: int(c.maxTokens),
 	}
+}
 
+func (c *Client) CreateChatCompletion(
+	ctx context.Context,
+	req openai.ChatCompletionRequest,
+) (response *openai.ChatCompletionResponse, err error) {
 	resp, err := c.client.CreateChatCompletion(ctx, req)
 	if err != nil {
-		return "", err
-	}
+		apiErr, ok := err.(*openai.APIError)
+		if ok && (apiErr.HTTPStatusCode == 429 || apiErr.HTTPStatusCode >= 500) {
+			const backoffSeconds = 10
+			fmt.Printf("Rate limit exceeded, waiting %d seconds...\n", backoffSeconds)
+			time.Sleep(backoffSeconds * time.Second)
 
-	return resp.Choices[0].Message.Content, nil
+			resp, err := c.client.CreateChatCompletion(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return &resp, nil
+
+		}
+		return nil, err
+	}
+	return &resp, nil
 }
 
-const yamlExample = `code_description: >
-  # Here, provide a detailed and precise explanation of the tested functionality, its invariants, and edge cases.
-  # Enumerate the different classes of input values and their possible combinations.
-
-specs:
-  # Begin with the simplest case. Example:
-  - 
-    name: TestAdd
-    description: "Specify the test description here"
-  
-  # If there are any error cases, describe them here. Example:
-  - 
-    name: TestAddOverflow
-    description: "Specify the test description here"
-  
-  # Then describe all other test cases, including edge cases. Example:
-  - 
-    name: TestAddNegativeNumbers
-    description: "Specify the test description here"
-`
-
-func promptForTestCase(whatToTest string, allCode string) []openai.ChatCompletionMessage {
-	systemContent :=
-		"As a TDD expert and QA analyst with advanced logic, analytics, and reasoning skills, you're tasked with generating test cases." +
-			"You use a precise and consice software specifications vocabulary, accessible to a Language Model."
+func promptForSpec(whatToTest string, allCode string, extraInstructions string) []openai.ChatCompletionMessage {
+	systemContent := "Acting as a senior software engineer you should make a step-by-step description for the user's code focusing on the specified part."
 
 	systemMsg := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
@@ -165,39 +215,35 @@ func promptForTestCase(whatToTest string, allCode string) []openai.ChatCompletio
 	}
 
 	userContent := fmt.Sprintf(
-		"Analyze the `%s` functionality in the following code: \n```go\n%s```\n"+
-			"Generate test cases, focusing on the `%s` functionality. Use only YAML as a response format. \nTemplate: \n```yaml\n%s\n```\n"+
-			"First, describe the tested functionality in the YAML `code_description` field. Enumerate what each element of the `%s` functionality does and the possible intentions of the author.\n"+
-			"Remember to only use the `name` and `description` fields in each test case.",
+		"Based on the provided code write a specification for the `%s` part.\n"+
+			"The code is: \n```go\n%s```\n",
 		whatToTest,
 		allCode,
-		whatToTest,
-		yamlExample,
-		whatToTest,
 	)
+	if extraInstructions != "" {
+		userContent += "\n" + extraInstructions
+	}
 	userMsg := openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
 		Content: userContent,
 	}
-	fmt.Println("System message:", systemMsg)
-	fmt.Println("User message:", userMsg)
+	log.Println("System spec message:", systemMsg)
+	log.Println("User spec message:", userMsg)
 	return []openai.ChatCompletionMessage{
 		systemMsg,
 		userMsg,
 	}
 }
 
-func (c *Client) GenerateTestCases(whatToTest string, allCode string) (string, error) {
-	//TODO: First generate just the text from multiple perspectives and merge it and then map it to yaml format
+func (c *Client) GenerateSpec(whatToTest string, allCode string, extraInstructions string) (string, error) {
+	log.Println(SectionSeparator)
+	log.Println("Generating spec for", whatToTest)
 	ctx := context.Background()
 
-	req := openai.ChatCompletionRequest{
-		Model:       openai.GPT4,
-		MaxTokens:   4000,
-		Temperature: 1,
-
-		Messages: promptForTestCase(whatToTest, allCode),
-	}
+	req := c.BasicCompletionRequest()
+	// req.Temperature = 0.8
+	// req.TopP = 1
+	req.Messages = promptForSpec(whatToTest, allCode, extraInstructions)
 
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
@@ -220,91 +266,293 @@ func (c *Client) GenerateTestCases(whatToTest string, allCode string) (string, e
 	}
 }
 
-// AggregateResponses combines responses into a single string, ensuring that the output is a valid Go tests file.
-func AggregateResponses(pkgName string, rs []string) string {
-	var imports strings.Builder
-	var functions strings.Builder
+func promptTestsList(whatToTest string, allCode string, extraInstructions string) []openai.ChatCompletionMessage {
+	systemContent := "Acting as a senior software engineer " +
+		"you should create an exhaustive and comprehensive list of tests to implement " +
+		"that would do full code coverage for the specified part of the code.\n" +
+		"Each test case should test only one concrete case. Return the list of descriptive test names."
 
-	importSet := make(map[string]struct{})
+	userContent := fmt.Sprintf(
+		"I want to test '%s'.\n"+
+			"The code is: \n```go\n%s```\n",
+		whatToTest,
+		allCode,
+	)
+	if extraInstructions != "" {
+		userContent += "\n" + extraInstructions
+	}
 
-	for _, response := range rs {
-		lines := strings.Split(response, "\n")
+	systemMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: systemContent,
+	}
 
-		for i := 0; i < len(lines); i++ {
-			line := lines[i]
-			trimmedLine := strings.TrimSpace(line)
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userContent,
+	}
+	log.Println("Generatin list of tests")
+	log.Println("System spec message:", systemMsg)
+	log.Println("User spec message:", userMsg)
+	return []openai.ChatCompletionMessage{
+		systemMsg,
+		userMsg,
+	}
+}
 
-			switch {
-			case isPackageDeclaration(trimmedLine), isGPTAddedCodeBlockDelimeter(trimmedLine):
-				continue
+func (c *Client) GenerateTestsList(whatToTest string, allCode string, extraInstructions string) (string, error) {
+	log.Println(SectionSeparator)
+	log.Println("Generating tests list for ", whatToTest)
+	ctx := context.Background()
 
-			case startsImportBlock(trimmedLine):
-				i += handleImportBlock(lines[i+1:], &imports, importSet)
+	req := c.BasicCompletionRequest()
+	// req.Temperature = 0.8
+	// req.TopP = 1
+	req.Messages = promptTestsList(whatToTest, allCode, extraInstructions)
 
-			case isSingleImportStatement(trimmedLine):
-				addImport(&imports, strings.TrimPrefix(trimmedLine, "import "), importSet)
-
-			default:
-				// Appending function bodies
-				functions.WriteString(line + "\n")
-			}
+	stream, err := c.client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	var result string
+	defer stream.Close()
+	for {
+		response, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return result, nil
 		}
-		functions.WriteString("\n")
-	}
 
-	return combineSections("package "+pkgName, imports.String(), functions.String())
-}
-
-func isPackageDeclaration(line string) bool {
-	return strings.HasPrefix(line, "package ")
-}
-func isGPTAddedCodeBlockDelimeter(line string) bool {
-	return strings.HasPrefix(line, "```")
-}
-
-func startsImportBlock(line string) bool {
-	return strings.HasPrefix(line, "import (")
-}
-
-func isSingleImportStatement(line string) bool {
-	return strings.HasPrefix(line, "import \"")
-}
-
-func handleImportBlock(lines []string, imports *strings.Builder, importSet map[string]struct{}) int {
-	for i, line := range lines {
-		trimmedLine := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmedLine, ")") {
-
-			return i + 1
+		if err != nil {
+			return "", err
 		}
-		addImport(imports, trimmedLine, importSet)
-	}
-	panic("import block not closed")
-}
 
-func addImport(imports *strings.Builder, importLine string, importSet map[string]struct{}) {
-	if _, exists := importSet[importLine]; !exists {
-		imports.WriteString("\t" + importLine + "\n")
-		importSet[importLine] = struct{}{}
+		fmt.Printf(response.Choices[0].Delta.Content)
+		result += response.Choices[0].Delta.Content
 	}
 }
 
-func combineSections(packageDecl, imports, functions string) string {
-	var combined strings.Builder
-	combined.WriteString(packageDecl)
-	combined.WriteString("\n")
-	if imports != "" {
-		combined.WriteString("\nimport (\n")
-		combined.WriteString(imports)
-		combined.WriteString(")\n\n")
+const yamlExample = `cases:
+  - 
+    name: TestThing_Condition1
+    instructions: |
+      1. Intialize mocks or input data
+      2. Execute the tested method
+      3. Expect the result to be equal to the expected value and all other expectations are met
+  
+  - 
+    name: TestThing_Condition2
+    instructions: TODO
+  
+  - 
+    name: TestThing_Action3_WhenSomething
+    instructions: TODO
+
+`
+
+func promptForTestCases(_ string, allCode string, list string, extraInstructions string) []openai.ChatCompletionMessage {
+	systemContent := fmt.Sprintf("Acting as a seniour developer "+
+		"you should read given code and create instructions to implement the tests.\n"+
+		"Using YAML format you should only write `cases` list with the `name` and `instructions` fields.\n"+
+		"`instructions` field should contain precise input description and output and/or mock expectations based on the provided code.\n"+
+		"Example schema: \n```yaml\n%s\n```\n", yamlExample)
+
+	systemMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: systemContent,
 	}
-	combined.WriteString(functions)
-	return combined.String()
+
+	userContent := fmt.Sprintf(
+		"Here is my code: \n```go\n%s```\n"+
+			"Refine these tests: \n\"\"\"%s\"\"\"\n",
+		allCode,
+		list,
+	)
+	if extraInstructions != "" {
+		userContent += "\n" + extraInstructions
+	}
+	userMsg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: userContent,
+	}
+	log.Println("System message:", systemMsg)
+	log.Println("User message:", userMsg)
+	return []openai.ChatCompletionMessage{
+		systemMsg,
+		userMsg,
+	}
+}
+
+func (c *Client) GenerateTestCases(whatToTest string, allCode string, testList string, extraInstructions string) (string, error) {
+	log.Println(SectionSeparator)
+	fmt.Println("Generating test cases")
+
+	// TODO: First generate just the text from multiple perspectives and merge it and then map it to yaml format
+	ctx := context.Background()
+
+	req := c.BasicCompletionRequest()
+	// req.Temperature = 0.8
+	// req.TopP = 1
+	req.Messages = promptForTestCases(whatToTest, allCode, testList, extraInstructions)
+
+	stream, err := c.client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	var result string
+	defer stream.Close()
+	for {
+		response, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return result, nil
+		}
+
+		if err != nil {
+			return "", err
+		}
+
+		fmt.Printf(response.Choices[0].Delta.Content)
+		result += response.Choices[0].Delta.Content
+	}
+}
+
+func mocksGenerationPromptSystem() string {
+	return "Acting as a senior software engineer should implement mocks to test the specific part of the code." +
+		"You may use github.com/stretchr/testify/mock. You should not write the tests itself, " +
+		"only implement mocks for dependencies of the code that needs to be tested, " +
+		"not the mock of the target method/struct but the mocks of the input/dependencies."
+}
+
+func mocksGenerationPromptUser(whatToTest string, allTheCode string) string {
+	return fmt.Sprintf(
+		"We want to test the '%s' part that so please create mocks for the future tests.\n"+
+			"Here is the original code: ```go\n%s```\n",
+		whatToTest,
+		allTheCode,
+	)
+}
+
+func (c *Client) GenerateMocks(
+	whatToTest string,
+	allCode string,
+	extraInstructions string,
+) (string, error) {
+	ctx := context.Background()
+
+	systemContent := mocksGenerationPromptSystem()
+	userContent := mocksGenerationPromptUser(whatToTest, allCode)
+
+	log.Println(SectionSeparator)
+	log.Println("Mocks generation system prompt: ", systemContent)
+	log.Println("Mocks generation user prompt: ", userContent)
+	if extraInstructions != "" {
+		userContent += "\n" + extraInstructions
+	}
+	req := c.BasicCompletionRequest()
+	req.Temperature = 0
+	req.TopP = 1
+	req.Messages = []openai.ChatCompletionMessage{
+		{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: systemContent,
+		},
+		{
+			Role:    openai.ChatMessageRoleUser,
+			Content: userContent,
+		},
+	}
+
+	resp, err := c.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Choices[0].Message.Content, nil
+}
+
+func commentLines(text string) string {
+	lines := strings.Split(text, "\n")
+	commentedText := ""
+
+	for _, line := range lines {
+		commentedLine := "// " + line
+		commentedText += commentedLine + "\n"
+	}
+
+	return commentedText
+}
+
+const codeTemplate = `package %s
+
+// Use this libs if needed
+import (
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require
+)
+
+func %s(t *testing.T) {
+}
+`
+
+func codeHeader(pkgName string) string {
+	return fmt.Sprintf("package %s\n\n", pkgName)
+}
+
+// TODO: Extract the code an polish it with gpt3.5
+func codeGenerationPrompt(_ string, spec Spec, allTheCode string, pkg string) string {
+	return fmt.Sprintf(
+		"Act as a senior developer.\n"+
+			"Based on this code: ```go\n%s```\nHelp me to implement a test function, replace the comments with your own code in this snippet: \n```go\n%s\n```",
+		allTheCode,
+		fmt.Sprintf(codeTemplate, pkg, spec.Name),
+	)
+}
+
+// Spec represents a single test specification.
+type Spec struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"instructions"`
+}
+
+// GenerateTestCode generates test code using the OpenAI chat completion API.
+func (c *Client) GenerateTestCode(
+	spec Spec,
+	whatToTest string,
+	allCode string,
+	pkg string,
+	extraInstructions string,
+) (string, error) {
+	ctx := context.Background()
+
+	content := codeGenerationPrompt(whatToTest, spec, allCode, pkg)
+	if extraInstructions != "" {
+		content += "\n" + extraInstructions
+	}
+
+	log.Println("Code generation prompt: ", content)
+	msg := openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: content,
+	}
+
+	req := c.BasicCompletionRequest()
+	req.Temperature = 0
+	req.TopP = 1
+	req.Messages = []openai.ChatCompletionMessage{
+		msg,
+	}
+
+	resp, err := c.CreateChatCompletion(ctx, req)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.Choices[0].Message.Content, nil
 }
 
 // WriteToFile writes the combined responses into a file.
 func WriteToFile(out string, fPath string) error {
-	file, err := os.OpenFile(fPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	file, err := os.OpenFile(fPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to open file for writing: %v", err)
 	}
@@ -325,9 +573,8 @@ func WriteToFile(out string, fPath string) error {
 
 // SpecList wraps the array of Specs for unmarshalling from YAML
 type SpecList struct {
-	Testing         string `yaml:"testing"`
-	CodeDescription string `yaml:"code_description"`
-	Specs           []Spec `yaml:"specs"`
+	Testing string `yaml:"testing"`
+	Specs   []Spec `yaml:"cases"`
 }
 
 // LoadTestSpecs loads test specifications from a file.
@@ -366,60 +613,87 @@ func removeYamlLines(input string) string {
 }
 
 func main() {
+	logFile, err := os.OpenFile("./goptest-debug.log", os.O_APPEND|os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		log.Panic(err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
+
 	specFilePath := flag.String("spec-file", "", "Path to the spec file")
 	codeFiles := flag.String("code-files", "", "Comma-separated paths to code files")
 	outputFilePath := flag.String("output-file", "", "Path to output file")
 	cases := flag.Bool("cases", false, "Generate cases or not, default false")
 	whatToTest := flag.String("what", "", "What to test")
+	model := flag.String("model", "gpt-4", "Model to use")
+	maxTokens := flag.Int("max-tokens", 4000, "Maximum tokens for output")
+	extraInstructions := flag.String("extra", "", "Extra instructions for the model")
 	flag.Parse()
 
 	if *specFilePath == "" || *codeFiles == "" {
-		log.Fatalf("spec-file, code-files, and output-file must be provided")
+		fatalf("spec-file, code-files, and output-file must be provided")
 	}
 
 	codeFilePaths := strings.Split(*codeFiles, ",")
 	pkgName, concatenatedCode, err := ConcatFiles(codeFilePaths)
 	if err != nil {
-		log.Fatalf("Failed to concatenate code files: %v", err)
+		fatalf("Failed to concatenate code files: %v", err)
 	}
 
-	apiClient, err := NewClient()
+	apiClient, err := NewClient(*model, *maxTokens)
 	if err != nil {
-		log.Fatalf("Failed to initialize OpenAI API client: %v", err)
+		fatalf("Failed to initialize OpenAI API client: %v", err)
 	}
 	if cases != nil && *cases {
 		if whatToTest != nil && *whatToTest == "" {
-			log.Fatalf("Must provide what to test")
+			fatalf("Must provide what to test")
 		}
-		fmt.Println("Generating test cases")
-		s, err := apiClient.GenerateTestCases(*whatToTest, concatenatedCode)
+
+		// spec, err := apiClient.GenerateSpec(*whatToTest, concatenatedCode, *extraInstructions)
+		// if err != nil {
+		// 	log.Fatalf("Failed to generate spec: %v", err)
+		// }
+
+		list, err := apiClient.GenerateTestsList(*whatToTest, concatenatedCode, *extraInstructions)
 		if err != nil {
-			log.Fatalf("Failed to generate test cases: %v", err)
+			fatalf("Failed to generate test list: %v", err)
+		}
+
+		s, err := apiClient.GenerateTestCases(*whatToTest, concatenatedCode, list, *extraInstructions)
+		if err != nil {
+			fatalf("Failed to generate test cases: %v", err)
 		}
 		s = "testing: " + *whatToTest + "\n" + removeYamlLines(s)
 		err = WriteToFile(s, *specFilePath)
 		if err != nil {
-			log.Fatalf("Failed to write test cases to file: %v", err)
+			fatalf("Failed to write test cases to file: %v", err)
 		}
 		fmt.Println("Done generating test cases")
 		fmt.Printf("Test cases written to %s\n", *specFilePath)
 		fmt.Println("Command to generate test code:")
-		fmt.Print("tester -spec-file=" + *specFilePath + " -code-files=" + *codeFiles + " -output-file=" + "generated_test.go")
+		fmt.Print("goptest -spec-file=" + *specFilePath + " -code-files=" + *codeFiles + " -output-file=" + "generated_test.go")
 		return
 	}
 
 	if *outputFilePath == "" {
-		log.Fatalf("Must provide output file path")
+		fatalf("Must provide output file path")
 	}
 
+	// TODO: Refine specs with mocks again - do multiple iterations
 	specs, err := LoadTestSpecs(*specFilePath)
 	if err != nil {
-		log.Fatalf("Failed to load test specs: %v", err)
+		fatalf("Failed to load test specs: %v", err)
 	}
+	// fmt.Println("Generating mocks code")
+	// mocksCode, err := apiClient.GenerateMocks(specs.Testing, concatenatedCode, *extraInstructions)
+	// if err != nil {
+	// 	log.Fatalf("Failed to generate mocks code: %v", err)
+	// }
 
 	responses := make([]string, len(specs.Specs))
 	var wg sync.WaitGroup
-	var max = make(chan struct{}, 4)
+	max := make(chan struct{}, 2)
 	for i, spec := range specs.Specs {
 		max <- struct{}{}
 		wg.Add(1)
@@ -429,9 +703,15 @@ func main() {
 			defer func() {
 				<-max
 			}()
-			code, err := apiClient.GenerateTestCode(spec, specs.Testing, specs.CodeDescription, concatenatedCode)
+			code, err := apiClient.GenerateTestCode(
+				spec,
+				specs.Testing,
+				concatenatedCode,
+				pkgName,
+				*extraInstructions,
+			)
 			if err != nil {
-				log.Fatalf("Failed to generate test code for spec '%s': %v", spec.Description, err)
+				fatalf("Failed to generate test code for spec '%s': %v", spec.Description, err)
 			}
 			responses[i] = code
 			fmt.Println("Done generating test")
@@ -440,11 +720,12 @@ func main() {
 
 	wg.Wait()
 
-	combinedCode := AggregateResponses(pkgName, responses)
+	// combinedCode := AggregateFiles(pkgName, append([]string{mocksCode}, responses...), true)
+	combinedCode := AggregateFiles(pkgName, responses, true)
 
 	err = WriteToFile(combinedCode, *outputFilePath)
 	if err != nil {
-		log.Fatalf("Failed to write output to file: %v", err)
+		fatalf("Failed to write output to file: %v", err)
 	}
 
 	fmt.Println("Test generation succeeded. Check the output file for the generated test code.")
